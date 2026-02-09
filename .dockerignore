@@ -1,0 +1,14 @@
+# Ignore build output for development
+node_modules/
+*.log
+
+# Don't ignore build folder - we need it in Docker
+!build/
+
+# Development files
+dev.html
+index.html
+embed-example.html
+
+# Source files (already bundled)
+# Keep src/ for debugging builds

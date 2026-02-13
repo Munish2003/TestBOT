@@ -1,0 +1,368 @@
+import asyncio
+import json
+import os
+import logging
+from langsmith import traceable
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import AIMessage, ToolMessage
+from client.config import llm
+from client.mcp_tools import mcpserver
+from client.memory_manager import RedisMessageManager
+from client.channel_config import get_channel_config
+from state import AgentContext, AgentState
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# ==================== AGENT SINGLETONS ====================
+
+# Channel-specific agent instances: {"web": agent, "whatsapp": agent}
+_agent_instances: dict = {}
+_agent_lock = asyncio.Lock()
+
+# Cached prompts per channel
+_channel_prompts: dict = {}
+
+
+# ==================== MIDDLEWARE ====================
+
+class InjectRedisContext(AgentMiddleware):
+    """Inject Redis conversation context before model call"""
+    
+    def before_model(self, state: dict, runtime) -> dict | None:
+        session_id = runtime.context.get("session_id")
+        if not session_id:
+            return None
+        
+        manager = RedisMessageManager(session_id)
+        context = manager.get_context_for_chat()
+        
+        # Check for WhatsApp user info (stored by webhook)
+        user_info = None
+        try:
+            user_info_key = f"user_info:{session_id}"
+            user_info_data = manager.redis.hgetall(user_info_key)
+            if user_info_data:
+                user_info = user_info_data
+        except Exception as e:
+            logger.warning(f"Could not fetch user info: {e}")
+        
+        # Build context message
+        context_parts = []
+        
+        # Add critical instruction at the TOP
+        context_parts.append("""
+================================
+CRITICAL: RESPONSE RULES
+================================
+
+You will receive conversation history below for CONTEXT ONLY.
+Your task is to respond ONLY to the CURRENT user message (the last message in the conversation).
+
+DO NOT:
+- Re-answer questions that have already been answered in the conversation history
+- Repeat information already provided in previous assistant responses
+- Address old queries - they have already been handled
+
+DO:
+- Use the history to understand what was already discussed
+- Build on previous answers without repeating them
+- Only answer the NEW/CURRENT question from the user
+- If the current question relates to a previous topic, reference it briefly but don't re-explain
+""")
+        
+        # Add WhatsApp user info if available
+        if user_info:
+            user_name = user_info.get("name", "Unknown")
+            user_phone = user_info.get("phone", "Unknown")
+            source = user_info.get("source", "unknown")
+            
+            context_parts.append(f"""
+================================
+USER INFORMATION (Auto-captured from {source.upper()})
+================================
+
+Name: {user_name}
+Phone: {user_phone}
+
+IMPORTANT: This user's contact info is already captured. 
+- Do NOT ask for their name - address them as "{user_name}"
+- Do NOT ask for their phone number - it's already {user_phone}
+- Focus on understanding their needs and providing information
+""")
+        
+        # Add conversation context if available
+        if context:
+            context_parts.append(f"""
+================================
+CONVERSATION HISTORY (FOR REFERENCE ONLY - DO NOT RE-ANSWER)
+================================
+
+{context}
+
+NOTE: The above shows what was ALREADY discussed. Do NOT answer these again.
+""")
+        
+        if context_parts:
+            context_msg = {
+                "role": "system",
+                "content": "\n".join(context_parts)
+            }
+            return {"messages": [context_msg] + state["messages"]}
+        
+        return None
+
+
+class HandleToolErrors(AgentMiddleware):
+    """Handle tool execution errors gracefully"""
+    
+    async def awrap_tool_call(self, request, handler):
+        try:
+            return await handler(request)
+        except Exception as e:
+            logger.warning(f"Tool error in {request.tool_call.get('name', 'unknown')}: {e}")
+            return ToolMessage(
+                content=f"Tool execution failed: {str(e)}",
+                tool_call_id=request.tool_call.get("id")
+            )
+
+
+# ==================== AGENT FACTORY ====================
+
+async def get_or_create_agent(channel: str = "web"):
+    """
+    Create channel-specific agent singleton with different prompts and tools.
+    
+    Args:
+        channel: The channel identifier ("web", "whatsapp", etc.)
+        
+    Returns:
+        LangChain agent configured for the specified channel
+    """
+    global _agent_instances, _channel_prompts
+
+    channel = channel.lower()
+    
+    # Return cached agent if exists
+    if channel in _agent_instances:
+        return _agent_instances[channel]
+
+    async with _agent_lock:
+        # Double-check after acquiring lock
+        if channel in _agent_instances:
+            return _agent_instances[channel]
+        
+        config = get_channel_config(channel)
+        logger.info(f"Creating {channel.upper()} agent | prompt={config.prompt_id} | tools={config.tools}")
+
+        try:
+            # Fetch tools from MCP with timeout protection
+            client = await asyncio.wait_for(mcpserver(), timeout=30.0)
+            all_tools = await asyncio.wait_for(client.get_tools(), timeout=30.0)
+
+            # Filter tools for this channel
+            selected_tools = [
+                tool for tool in all_tools
+                if tool.name in config.tools
+            ]
+            
+            logger.info(f"Selected {len(selected_tools)} tools for {channel}: {[t.name for t in selected_tools]}")
+
+            # Fetch channel-specific prompt
+            prompt_response = await asyncio.wait_for(
+                client.get_prompt(
+                    server_name="DB_MCP",
+                    prompt_name="get_prompt",
+                    arguments={"prompt_id": config.prompt_id}
+                ),
+                timeout=30.0
+            )
+            prompt_text = prompt_response[0].content
+            
+            # Log error if prompt not found or empty
+            if not prompt_text or not prompt_text.strip():
+                logger.error(f"❌ Prompt '{config.prompt_id}' returned empty/blank from PostgreSQL")
+            elif prompt_text.startswith("Error:"):
+                logger.error(f"❌ Prompt '{config.prompt_id}' not found in PostgreSQL: {prompt_text}")
+                
+            _channel_prompts[channel] = prompt_text
+
+            # Create agent with channel-specific configuration
+            agent = create_agent(
+                model=llm,
+                tools=selected_tools,
+                system_prompt=prompt_text,
+                middleware=[
+                    InjectRedisContext(),
+                    HandleToolErrors()
+                ],
+                context_schema=AgentContext
+            )
+
+            _agent_instances[channel] = agent
+            logger.info(f"✅ {channel.upper()} agent created successfully")
+
+            return agent
+
+        except asyncio.TimeoutError:
+            logger.error(f"⏰ {channel.upper()} agent initialization timed out (30s)")
+            raise RuntimeError(f"MCP server took too long to respond for {channel} agent. Please try again.")
+
+
+# ==================== QUERY PROCESSING ====================
+
+@traceable(
+    run_type="chain",
+    name="process_query",
+    project_name=os.getenv("LANGSMITH_PROJECT")
+)
+async def process_query(query: str, session_id: str, channel: str = "web"):
+    """
+    Process query with channel-specific agent and middleware-based context injection.
+    
+    Args:
+        query: User's message
+        session_id: Session identifier
+        channel: Channel identifier ("web", "whatsapp", etc.)
+    """
+    
+    # Get channel-specific agent
+    agent = await get_or_create_agent(channel=channel)
+
+    # Get Redis manager for this session
+    message_manager = RedisMessageManager(session_id)
+
+    # Store user message in Redis (triggers summary if needed)
+    await message_manager.add_message(
+        "user",
+        query,
+        input_tokens=0,
+        output_tokens=0
+    )
+
+    full_response = ""
+    usage_metadata = None
+
+    try:
+        # Use ainvoke for reliability with reasoning models (Grok 4)
+        # Streaming via astream doesn't work reliably with all LLM providers
+        logger.info(f"Processing query for session {session_id}: {query[:50]}...")
+        
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": query}]},
+            config={"configurable": {"session_id": session_id}}
+        )
+        
+        # Extract response from result messages
+        if isinstance(result, dict) and 'messages' in result:
+            for msg in result['messages']:
+                if isinstance(msg, AIMessage) and msg.content:
+                    content = msg.content
+                    
+                    # Handle list-type content from reasoning models
+                    if isinstance(content, list):
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif isinstance(item, str):
+                                text_parts.append(item)
+                        content = "".join(text_parts)
+                    
+                    if content and isinstance(content, str):
+                        full_response = content
+                        
+                        # Yield content in chunks for streaming feel
+                        # Split into ~50 char chunks for smooth streaming
+                        chunk_size = 50
+                        for i in range(0, len(content), chunk_size):
+                            chunk = content[i:i + chunk_size]
+                            yield {
+                                "type": "token",
+                                "content": chunk,
+                                "node": "model"
+                            }
+                            # Small delay for streaming effect (optional)
+                            await asyncio.sleep(0.01)
+                    
+                    # Capture usage metadata
+                    if hasattr(msg, 'usage_metadata') and msg.usage_metadata:
+                        usage_metadata = msg.usage_metadata
+                        
+                elif isinstance(msg, ToolMessage):
+                    # Handle tool results
+                    tool_name = getattr(msg, 'name', 'unknown')
+                    tool_content = msg.content
+                    
+                    # Handle lead tracking
+                    if tool_name in ["check_lead", "create_lead"]:
+                        try:
+                            tool_data = tool_content
+                            if isinstance(tool_data, str):
+                                try:
+                                    tool_data = json.loads(tool_data)
+                                except json.JSONDecodeError:
+                                    pass
+                            
+                            if isinstance(tool_data, dict) and tool_data.get("status") == "success":
+                                l_id = tool_data.get("lead_id")
+                                if l_id:
+                                    message_manager.set_lead_id(l_id)
+                                    logger.info(f"[LEAD TRACKING] Captured Lead ID: {l_id}")
+                        except Exception as e:
+                            logger.error(f"[LEAD TRACKING] Error: {e}")
+                    
+                    # Serialize tool content
+                    if isinstance(tool_content, list):
+                        serialized_items = []
+                        for item in tool_content:
+                            if hasattr(item, 'model_dump'):
+                                serialized_items.append(item.model_dump())
+                            elif hasattr(item, '__dict__'):
+                                serialized_items.append(vars(item))
+                            elif isinstance(item, dict):
+                                serialized_items.append(item)
+                            else:
+                                serialized_items.append(str(item))
+                        tool_content = json.dumps(serialized_items)
+                    elif isinstance(tool_content, dict):
+                        tool_content = json.dumps(tool_content)
+                    elif not isinstance(tool_content, str):
+                        tool_content = str(tool_content)
+                    
+                    yield {
+                        "type": "tool_result",
+                        "tool_name": tool_name,
+                        "content": tool_content,
+                        "node": "tools"
+                    }
+        
+        logger.info(f"Response generated for session {session_id}: {len(full_response)} chars")
+
+    except asyncio.CancelledError:
+        logger.warning(f"⚠️ Stream cancelled for session {session_id} - client likely disconnected")
+        if full_response:
+            await message_manager.add_message(
+                "assistant",
+                full_response + " [Response interrupted]",
+                input_tokens=0,
+                output_tokens=0
+            )
+        return
+
+    except Exception as e:
+        logger.error(f"❌ Error for session {session_id}: {e}", exc_info=True)
+        yield {"type": "error", "error": str(e)}
+        return
+
+    # Save assistant response with exact token counts
+    input_tokens = usage_metadata.get("input_tokens", 0) if usage_metadata else 0
+    output_tokens = usage_metadata.get("output_tokens", 0) if usage_metadata else 0
+
+    await message_manager.add_message(
+        "assistant",
+        full_response,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens
+    )

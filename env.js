@@ -14,7 +14,7 @@
 window.CHATBOT_ENV = {
     // Backend API URL - Injected by GitHub Actions from secrets.CHATBOT_API_URL
     // Production: https://zox-edu-ai.southindia.cloudapp.azure.com/chatbot
-    API_URL: 'https://pseudoevangelically-primatial-latasha.ngrok-free.devs',
+    API_URL: 'http://localhost:8000',
 
     // Session Configuration
     SESSION_EXPIRY_DAYS: 7,

@@ -8,31 +8,23 @@ class APIClient {
         this.baseUrl = config.apiUrl;
     }
 
-    /**
-     * Send a chat message and handle streaming response
-     * @param {string} query - User's message
-     * @param {string} sessionId - Current session ID
-     * @param {function} onToken - Callback for each token received (content, node)
-     * @param {function} onToolResult - Callback for tool results
-     * @param {function} onComplete - Callback when stream completes
-     * @param {function} onError - Callback for errors
-     */
-
     async checkSessionStatus(sessionId) {
         try {
             const response = await fetch(`${this.baseUrl}/session/${sessionId}/status`);
             return await response.json();
         } catch (error) {
-            window.DebugLogger.error('Status check failed:', error);
             return { expired: false };
         }
     }
+
     async sendMessage(query, sessionId, callbacks) {
         const { onToken, onToolResult, onComplete, onError } = callbacks;
 
-        // 60 second timeout to prevent browser from randomly aborting
+        // 120 second timeout for initial response (handles cold starts + token refresh)
         const controller = new AbortController();
-        let timeoutId = setTimeout(() => controller.abort(), 60000);
+        let timeoutId = setTimeout(() => {
+            controller.abort();
+        }, 120000);
 
         try {
             const response = await fetch(`${this.baseUrl}/chat`, {
@@ -47,7 +39,7 @@ class APIClient {
                 signal: controller.signal
             });
 
-            clearTimeout(timeoutId);  // Clear timeout on successful response
+            clearTimeout(timeoutId);
 
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
@@ -58,21 +50,30 @@ class APIClient {
             const decoder = new TextDecoder();
             let buffer = '';
 
+            // Stream-level inactivity timeout: resets on every chunk received
+            let inactivityTimeout;
+            const resetInactivity = () => {
+                clearTimeout(inactivityTimeout);
+                inactivityTimeout = setTimeout(() => {
+                    controller.abort();
+                }, 90000);
+            };
+            resetInactivity();
+
             while (true) {
                 const { done, value } = await reader.read();
 
                 if (done) {
-                    window.DebugLogger.log('Stream complete');
+                    clearTimeout(inactivityTimeout);
                     if (onComplete) onComplete();
                     break;
                 }
 
-                // Decode chunk and add to buffer
+                resetInactivity();
                 buffer += decoder.decode(value, { stream: true });
 
-                // Process complete JSON lines
                 const lines = buffer.split('\n');
-                buffer = lines.pop(); // Keep incomplete line in buffer
+                buffer = lines.pop();
 
                 for (const line of lines) {
                     if (line.trim() === '') continue;
@@ -80,38 +81,30 @@ class APIClient {
                     try {
                         const data = JSON.parse(line);
 
-                        // Handle different message types
                         if (data.type === 'token') {
                             if (onToken) onToken(data.content, data.node);
-
                         } else if (data.type === 'heartbeat') {
-                            // Keep-alive signal
-                            window.DebugLogger.log('Heartbeat received');
+                            // Keep-alive signal — no action needed
                         } else if (data.type === 'tool_start') {
-                            // Tool started
-                            window.DebugLogger.log('Tool started:', data.tool_name);
+                            // Tool execution started
                         } else if (data.type === 'tool_result') {
                             if (onToolResult) onToolResult(data.tool_name, data.content);
-                        } else if (data.done) {
+                        } else if (data.type === 'error') {
+                            if (onError) onError(new Error(data.error));
+                        } else if (data.type === 'done' || data.done) {
                             if (onComplete) onComplete();
                         }
                     } catch (e) {
-                        window.DebugLogger.error('Error parsing JSON line:', { line, error: e });
+                        // Skip malformed JSON lines
                     }
                 }
             }
 
         } catch (error) {
-            window.DebugLogger.error('Error sending message:', error);
             if (onError) onError(error);
         }
     }
 
-    /**
-     * Initialize session with lead_id for returning users
-     * @param {string} sessionId - New session ID
-     * @param {string} leadId - Existing lead ID from localStorage
-     */
     async initSession(sessionId, leadId) {
         try {
             const response = await fetch(`${this.baseUrl}/session/init`, {
@@ -125,17 +118,11 @@ class APIClient {
                 })
             });
 
-            const data = await response.json();
-            window.DebugLogger.log('Session initialized:', data);
-            return data;
+            return await response.json();
         } catch (error) {
-            window.DebugLogger.error('Error initializing session:', error);
-            // Non-critical error, continue anyway
             return null;
         }
     }
 }
 
-// Export for use in other modules
 window.APIClient = APIClient;
-

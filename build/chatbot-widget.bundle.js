@@ -1,7 +1,7 @@
 /**
  * Chatbot Widget Bundle
  * Auto-generated - Do not edit directly
- * Generated: 2026-01-20T04:55:17.654Z
+ * Generated: 2026-02-19T09:15:30.107Z
  */
 
 // Auto-inject CSS styles
@@ -30,7 +30,7 @@
 window.CHATBOT_ENV = {
     // Backend API URL - Injected by GitHub Actions from secrets.CHATBOT_API_URL
     // Production: https://zox-edu-ai.southindia.cloudapp.azure.com/chatbot
-    API_URL: 'http://localhost:8000',
+    API_URL: 'https://pseudoevangelically-primatial-latasha.ngrok-free.dev',
 
     // Session Configuration
     SESSION_EXPIRY_DAYS: 7,
@@ -196,99 +196,112 @@ window.DebugLogger = new DebugLogger();
 // ============ src/session-manager.js ============
 /**
  * SessionManager - Handles localStorage-based session persistence
- * Manages session_id, lead_id, and expiry logic
- * 
- * IMPORTANT: Session is cached in memory to prevent regenerating session_id on every call
+ * Manages session_id, lead_id, and expiry logic.
+ * LOGIC SUMMARY:
+ * 1. Anonymous Users: Session is ephemeral. Refreshing the page creates a NEW session_id.
+ * 2. Identified Leads: Session is persistent. Refreshing the page restores the existing session_id.
  */
 
 class SessionManager {
     constructor(config) {
-        this.storageKey = config.sessionStorageKey;
-        this.expiryDays = config.expiryDays;
+        this.storageKey = config.sessionStorageKey || 'chatbot_session_v2';
+        this.expiryDays = config.expiryDays || 7;
         this._cachedSession = null; // In-memory cache to prevent repeated regeneration
     }
 
     /**
      * Generate a unique session ID using Web Crypto API
-     * Format: sess_<uuid>
-     * 
-     * Uses crypto.randomUUID() for cryptographically secure random IDs
-     * More secure than Math.random() and standards-compliant
      */
     generateSessionId() {
-        return `sess_${crypto.randomUUID()}`;
+        return `IMT_sess_${crypto.randomUUID()}`;
     }
 
     /**
-     * Get or create session data (with caching)
-     * Returns: { session_id, lead_id, phone, email, name, created_at, last_activity, isReturning }
-     * 
-     * NOTE: Session is cached in memory. session_id is generated ONCE per page load.
+     * Get existing session or create a new one.
+     * This is the "Brain" of the session logic.
      */
     getOrCreateSession() {
-        // Return cached session if available (prevents regenerating session_id)
-        if (this._cachedSession) {
-            return this._cachedSession;
-        }
-
+        const now = new Date();
         const stored = localStorage.getItem(this.storageKey);
+
+        // 1. Double-check memory cache vs timeout before returning it
+        if (this._cachedSession) {
+            // Check if what we have in memory is actually expired
+            const lastActivity = new Date(this._cachedSession.last_activity);
+            const daysSinceActivity = (now - lastActivity) / (1000 * 60 * 60 * 24);
+
+            if (daysSinceActivity <= this.expiryDays) {
+                return this._cachedSession;
+            } else {
+                window.DebugLogger.log('In-memory Lead session expired.');
+                this.clearSession();
+                // Proceed to create/restore fresh
+            }
+        }
 
         if (stored) {
             try {
                 const data = JSON.parse(stored);
 
-                // Check if expired
+                // ============================================================
+                // 🛑 CRITICAL LOGIC: ANONYMOUS vs LEAD
+                // ============================================================
+                // If there is NO lead_id, this user is anonymous.
+                // We do NOT want to persist anonymous sessions across refreshes.
+                // Therefore, we discard the stored data and create a fresh session.
+                if (!data.lead_id) {
+                    window.DebugLogger.log('Anonymous user refresh detected - Generating NEW session.');
+                    return this._createNewSession();
+                }
+
+                // ============================================================
+                // 🛑 EXPIRY CHECK (Only for Leads)
+                // ============================================================
                 const lastActivity = new Date(data.last_activity);
-                const now = new Date();
                 const daysSinceActivity = (now - lastActivity) / (1000 * 60 * 60 * 24);
 
                 if (daysSinceActivity > this.expiryDays) {
-                    // Expired - clear and create new
-                    window.DebugLogger.log('Session expired, creating new session');
+                    window.DebugLogger.log('Lead session expired - Generating NEW session.');
                     localStorage.removeItem(this.storageKey);
                     return this._createNewSession();
                 }
 
-                // Returning user - generate NEW session_id for this conversation
-                // Each page load (refresh/tab close) starts a new conversation session
-                // but lead_id and user data persist for recognition
-                const isReturning = data.lead_id !== null;
-                const newSession = {
+                // ============================================================
+                // ✅ RESTORE LEAD SESSION
+                // ============================================================
+                // The user is a known lead and the session is valid. Restore it.
+                // We generate a NEW session_id for the *chat conversation* // but we attach the existing `lead_id` to it so the bot knows them.
+                const restoredSession = {
                     ...data,
-                    session_id: this.generateSessionId(), // New session per page load
+                    session_id: this.generateSessionId(), // Optional: Keep ID or rotate it. Rotating is safer for "Conversation" logic.
                     last_activity: now.toISOString(),
-                    isReturning: isReturning,
-                    contactProvidedInSession: false
+                    isReturning: true
                 };
 
-                // Cache and save
-                this._cachedSession = newSession;
-                this._saveToStorage(newSession);
+                this._cachedSession = restoredSession;
+                this._saveToStorage(restoredSession);
 
-                if (isReturning) {
-                    window.DebugLogger.log('Returning user detected, lead_id:', data.lead_id);
-                }
-                return newSession;
+                window.DebugLogger.log('Returning Lead detected:', restoredSession.lead_id);
+                return restoredSession;
 
             } catch (e) {
-                window.DebugLogger.error('Error parsing session data:', e);
+                window.DebugLogger.error('Corrupt session data found - Resetting.', e);
                 return this._createNewSession();
             }
-        } else {
-            // New user
-            return this._createNewSession();
         }
+
+        // No stored data found -> Create New Session
+        return this._createNewSession();
     }
 
-
     /**
-     * Create a new session for first-time user
+     * Create a brand new session with default values
      */
     _createNewSession() {
         const now = new Date().toISOString();
         const newSession = {
             session_id: this.generateSessionId(),
-            lead_id: null,
+            lead_id: null,      // Important: null means anonymous
             phone: null,
             email: null,
             name: null,
@@ -297,142 +310,108 @@ class SessionManager {
             isReturning: false,
             messageCount: 0,
             contactProvidedInSession: false
-
         };
 
         // Cache and save
         this._cachedSession = newSession;
         this._saveToStorage(newSession);
-        window.DebugLogger.log('New session created:', newSession.session_id);
+
+        window.DebugLogger.log('New Session Created:', newSession.session_id);
         return newSession;
     }
 
-    
-    //track user messages
-/**
- * Increment user message count
- */
-incrementMessageCount() {
-    if (!this._cachedSession) {
-        this.getOrCreateSession();
-    }
-    
-    if (!this._cachedSession.messageCount) {
-        this._cachedSession.messageCount = 0;
-    }
-    
-    this._cachedSession.messageCount++;
-    this._saveToStorage(this._cachedSession);
-    
-    return this._cachedSession.messageCount;
-}
-
-/**
- * Get current message count
- */
-getMessageCount() {
-    const session = this.getOrCreateSession();
-    return session.messageCount || 0;
-}
-
-/**
- * Reset message count (call this when lead is captured)
- */
-resetMessageCount() {
-    if (this._cachedSession) {
-        this._cachedSession.messageCount = 0;
-        this._saveToStorage(this._cachedSession);
-    }
-}
-
-/**
- * Mark that contact details were provided in this session
- */
-markContactProvided() {
-    if (this._cachedSession) {
-        this._cachedSession.contactProvidedInSession = true;
-        this._saveToStorage(this._cachedSession);
-        window.DebugLogger.log('Contact provided flag set for current session');
-    }
-}
-
-
     /**
-     * Internal: Save session to localStorage without triggering cache invalidation
-     */
-    _saveToStorage(sessionData) {
-        localStorage.setItem(this.storageKey, JSON.stringify(sessionData));
-    }
-
-    /**
-     * Save/update session data to localStorage and update cache
-     */
-    saveSession(sessionData) {
-        sessionData.last_activity = new Date().toISOString();
-        this._cachedSession = sessionData;  // Update cache
-        this._saveToStorage(sessionData);
-    }
-
-    /**
-     * Update session with lead information
-     * Called when agent captures user's contact info
+     * Update session when a user provides contact info (Lead Capture)
+     * This "locks" the session so it persists on refresh.
      */
     updateLeadInfo(leadId, phone, email, name) {
-        // Use cached session directly - don't call getOrCreateSession()
         if (!this._cachedSession) {
-            this.getOrCreateSession();  // Initialize if needed
+            this.getOrCreateSession();
         }
 
+        // Update fields
         this._cachedSession.lead_id = leadId;
         this._cachedSession.phone = phone || this._cachedSession.phone;
         this._cachedSession.email = email || this._cachedSession.email;
         this._cachedSession.name = name || this._cachedSession.name;
-        
-        this.resetMessageCount();  // Add this line
+        this._cachedSession.isReturning = true;
+
+        // Reset message count on successful capture
+        this.resetMessageCount();
+
+        // Save immediately
         this.saveSession(this._cachedSession);
-        window.DebugLogger.log('Lead info updated:', { leadId, phone, email, name });
+        window.DebugLogger.log('Lead Captured & Session Locked:', { leadId, phone });
     }
 
-    /**
-     * Update activity timestamp (lightweight - no session regeneration)
-     * Call this on every message sent/received
-     */
+    // ==========================================
+    // HELPER METHODS
+    // ==========================================
+
+    _saveToStorage(sessionData) {
+        localStorage.setItem(this.storageKey, JSON.stringify(sessionData));
+    }
+
+    saveSession(sessionData) {
+        sessionData.last_activity = new Date().toISOString();
+        this._cachedSession = sessionData;
+        this._saveToStorage(sessionData);
+    }
+
     updateActivity() {
-        // Only update timestamp in storage, don't regenerate session
         if (this._cachedSession) {
             this._cachedSession.last_activity = new Date().toISOString();
             this._saveToStorage(this._cachedSession);
         }
     }
 
-    /**
-     * Clear session data (logout/reset)
-     */
-    clearSession() {
-        this._cachedSession = null;  // Clear cache
-        localStorage.removeItem(this.storageKey);
-        window.DebugLogger.log('Session cleared');
+    incrementMessageCount() {
+        if (!this._cachedSession) this.getOrCreateSession();
+
+        if (!this._cachedSession.messageCount) {
+            this._cachedSession.messageCount = 0;
+        }
+
+        this._cachedSession.messageCount++;
+        this._saveToStorage(this._cachedSession);
+        return this._cachedSession.messageCount;
     }
 
-    /**
-     * Get current session ID
-     */
+    getMessageCount() {
+        const session = this.getOrCreateSession();
+        return session.messageCount || 0;
+    }
+
+    resetMessageCount() {
+        if (this._cachedSession) {
+            this._cachedSession.messageCount = 0;
+            this._saveToStorage(this._cachedSession);
+        }
+    }
+
+    markContactProvided() {
+        if (this._cachedSession) {
+            this._cachedSession.contactProvidedInSession = true;
+            this._saveToStorage(this._cachedSession);
+        }
+    }
+
+    clearSession() {
+        this._cachedSession = null;
+        localStorage.removeItem(this.storageKey);
+        window.DebugLogger.log('Session Cleared');
+    }
+
     getSessionId() {
         const session = this.getOrCreateSession();
         return session.session_id;
     }
 
-    /**
-     * Get current lead ID (null if not registered)
-     */
     getLeadId() {
         const session = this.getOrCreateSession();
         return session.lead_id;
     }
 
-    /**
-     * Check if user is a returning user
-     */
     isReturningUser() {
         const session = this.getOrCreateSession();
         return session.isReturning && session.lead_id !== null;
@@ -441,7 +420,6 @@ markContactProvided() {
 
 // Export for use in other modules
 window.SessionManager = SessionManager;
-
 // ============ src/api-client.js ============
 /**
  * APIClient - Handles all communication with the FastAPI backend
@@ -465,7 +443,11 @@ class APIClient {
 
     async checkSessionStatus(sessionId) {
         try {
-            const response = await fetch(`${this.baseUrl}/session/${sessionId}/status`);
+            const response = await fetch(`${this.baseUrl}/session/${sessionId}/status`, {
+                headers: {
+                    'ngrok-skip-browser-warning': 'true'
+                }
+            });
             return await response.json();
         } catch (error) {
             window.DebugLogger.error('Status check failed:', error);
@@ -477,13 +459,14 @@ class APIClient {
 
         // 60 second timeout to prevent browser from randomly aborting
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 60000);
+        let timeoutId = setTimeout(() => controller.abort(), 60000);
 
         try {
             const response = await fetch(`${this.baseUrl}/chat`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'ngrok-skip-browser-warning': 'true'
                 },
                 body: JSON.stringify({
                     query: query,
@@ -495,7 +478,13 @@ class APIClient {
             clearTimeout(timeoutId);  // Clear timeout on successful response
 
             if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
+                // Extract FastAPI error detail from response body
+                let detail = `HTTP error! status: ${response.status}`;
+                try {
+                    const errorBody = await response.json();
+                    if (errorBody.detail) detail = errorBody.detail;
+                } catch (e) { /* ignore parse errors */ }
+                throw new Error(detail);
             }
 
             // Handle streaming NDJSON response
@@ -508,6 +497,22 @@ class APIClient {
 
                 if (done) {
                     window.DebugLogger.log('Stream complete');
+
+                    // Process any remaining buffer content
+                    if (buffer.trim()) {
+                        try {
+                            const data = JSON.parse(buffer);
+                            // Process valid data types
+                            if (data.type === 'token' && onToken) {
+                                onToken(data.content, data.node);
+                            } else if (data.type === 'tool_result' && onToolResult) {
+                                onToolResult(data.tool_name, data.content);
+                            }
+                        } catch (e) {
+                            window.DebugLogger.error('Error parsing final buffer:', e);
+                        }
+                    }
+
                     if (onComplete) onComplete();
                     break;
                 }
@@ -528,6 +533,13 @@ class APIClient {
                         // Handle different message types
                         if (data.type === 'token') {
                             if (onToken) onToken(data.content, data.node);
+
+                        } else if (data.type === 'heartbeat') {
+                            // Keep-alive signal
+                            window.DebugLogger.log('Heartbeat received');
+                        } else if (data.type === 'tool_start') {
+                            // Tool started
+                            window.DebugLogger.log('Tool started:', data.tool_name);
                         } else if (data.type === 'tool_result') {
                             if (onToolResult) onToolResult(data.tool_name, data.content);
                         } else if (data.done) {
@@ -556,6 +568,7 @@ class APIClient {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'ngrok-skip-browser-warning': 'true'
                 },
                 body: JSON.stringify({
                     session_id: sessionId,
@@ -636,24 +649,24 @@ class UIManager {
 
 // Add this method to UIManager class
 
-showContactWarning() {
-    const messageDiv = document.createElement('div');
-    messageDiv.className = 'chatbot-message chatbot-message-ai chatbot-system-message';
-    messageDiv.innerHTML = `
-        <div class="chatbot-message-avatar">
-            🤖
-        </div>
-        <div class="chatbot-message-bubble" style="background: #FFF7ED; border-left: 4px solid #F97316;">
-            <div class="chatbot-message-content" style="color: #9A3412;">
-                <strong>⚠️ Contact Details Required</strong><br>
-                Since you haven't provided your contact details, we won't be able to register you or send you any notifications. Please share your contact information!
-            </div>
-        </div>
-    `;
+// showContactWarning() {
+//     const messageDiv = document.createElement('div');
+//     messageDiv.className = 'chatbot-message chatbot-message-ai chatbot-system-message';
+//     messageDiv.innerHTML = `
+//         <div class="chatbot-message-avatar">
+//             🤖
+//         </div>
+//         <div class="chatbot-message-bubble" style="background: #FFF7ED; border-left: 4px solid #F97316;">
+//             <div class="chatbot-message-content" style="color: #9A3412;">
+//                 <strong>⚠️ Contact Details Required</strong><br>
+//                 Since you haven't provided your contact details, we won't be able to register you or send you any notifications. Please share your contact information!
+//             </div>
+//         </div>
+//     `;
     
-    this.messagesContainer.appendChild(messageDiv);
-    this._scrollToBottom();
-}
+//     this.messagesContainer.appendChild(messageDiv);
+//     this._scrollToBottom();
+// }
 
 
     showExpiryMessage(isArchived = false) {
@@ -1004,6 +1017,7 @@ window.UIManager = UIManager;
 /**
  * ChatbotWidget - Main controller that orchestrates all components
  * This is the entry point and public API
+ * CLEANED VERSION: Session-only, no lead/identity logic
  */
 
 (function () {
@@ -1016,7 +1030,7 @@ window.UIManager = UIManager;
             this.apiClient = null;
             this.uiManager = null;
             this.initialized = false;
-            this.pollingInterval = null;
+            this._sseAbortController = null;
         }
 
         /**
@@ -1025,7 +1039,6 @@ window.UIManager = UIManager;
          */
         init(userConfig = {}) {
             if (this.initialized) {
-                console.warn('Chatbot already initialized');
                 return;
             }
 
@@ -1044,80 +1057,113 @@ window.UIManager = UIManager;
             // Set up event listeners
             this._setupEventListeners();
 
-            // Initialize session
+            // Initialize session (Ensure ID exists)
             this._initializeSession();
 
-            // Start inactivity polling
-            this._startInactivityPolling();
+            // Start real-time session event stream (SSE)
+            this._startSessionEventStream();
 
-            // Show greeting
+            // Show generic greeting
             this.uiManager.showGreeting();
 
             this.initialized = true;
-            console.log('Chatbot widget initialized successfully');
         }
 
         /**
-         * Initialize session (handle returning users)
+         * Initialize session
+         * Purely ensures a valid session_id exists. No backend handshake required.
          */
         async _initializeSession() {
-            const session = this.sessionManager.getOrCreateSession();
-
-            // If returning user with lead_id, initialize backend session
-            if (session.isReturning && session.lead_id) {
-                console.log('Returning user detected, initializing session with lead_id');
-                await this.apiClient.initSession(session.session_id, session.lead_id);
-                // Reset message count for returning users with lead_id
-                this.sessionManager.resetMessageCount();
-            }
+            this.sessionManager.getOrCreateSession();
         }
 
         /**
-         * Start polling backend for session expiry
+         * Start real-time SSE stream for session events (archive notifications)
+         * Uses fetch() instead of EventSource to support custom headers (ngrok requires it)
          */
-        _startInactivityPolling() {
-            if (this.pollingInterval) clearInterval(this.pollingInterval);
+        _startSessionEventStream() {
+            // Abort any existing connection
+            if (this._sseAbortController) {
+                this._sseAbortController.abort();
+                this._sseAbortController = null;
+            }
 
-            this.pollingInterval = setInterval(async () => {
-                const session = this.sessionManager.getOrCreateSession();
-                const sessionId = session.session_id;
-                if (!sessionId) return;
+            const session = this.sessionManager.getOrCreateSession();
+            const sessionId = session.session_id;
+            if (!sessionId) return;
 
-                // Check backend status
-                const status = await this.apiClient.checkSessionStatus(sessionId);
-                console.log(`🔄 [POLLING] Session ${sessionId.substring(0, 16)}... status:`, status);
-                
-                // If session expired on backend
-                if (status && status.expired === true) {
-                    console.warn("⏰ Session expired due to inactivity (detected by polling)");
-                    
-                    // Stop polling temporarily to prevent multiple triggers
-                    clearInterval(this.pollingInterval);
-                    
-                    // Clear old messages from UI
-                    this.uiManager.clearMessages();
-                    
-                    // Show expiry message
-                    this.uiManager.showExpiryMessage();
-                    
-                    // Clear local session data
-                    const oldLeadId = this.sessionManager.getLeadId();
-                    this.sessionManager._cachedSession = null;
-                    
-                    // Create new session
-                    const newSession = this.sessionManager.getOrCreateSession();
-                    console.log(`🔄 New session created: ${newSession.session_id}`);
-                    
-                    // Re-initialize on backend with old lead_id if exists
-                    if (oldLeadId) {
-                        await this.apiClient.initSession(newSession.session_id, oldLeadId);
-                        console.log(`🔗 Linked old lead_id ${oldLeadId} to new session`);
+            const url = `${this.config.apiUrl}/session/${sessionId}/events`;
+            this._sseAbortController = new AbortController();
+
+            const self = this;
+
+            (async function () {
+                try {
+                    const response = await fetch(url, {
+                        headers: {
+                            'ngrok-skip-browser-warning': 'true',
+                            'Accept': 'text/event-stream'
+                        },
+                        signal: self._sseAbortController.signal
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`SSE HTTP error: ${response.status}`);
                     }
-                    
-                    // Restart polling with new session
-                    this._startInactivityPolling();
+
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+
+                        buffer += decoder.decode(value, { stream: true });
+
+                        // Process complete SSE events (separated by double newline)
+                        const events = buffer.split('\n\n');
+                        buffer = events.pop(); // keep incomplete event
+
+                        for (const event of events) {
+                            if (!event.trim() || event.startsWith(':')) continue; // skip keepalives/comments
+
+                            // Parse "data: {...}" lines
+                            const dataLine = event.split('\n').find(l => l.startsWith('data: '));
+                            if (!dataLine) continue;
+
+                            try {
+                                const data = JSON.parse(dataLine.substring(6));
+                                if (data.type === 'archived') {
+                                    window.DebugLogger.log('📡 Received archive event via SSE');
+
+                                    // Clear old messages from UI
+                                    self.uiManager.clearMessages();
+
+                                    // Show expiry message
+                                    self.uiManager.showExpiryMessage();
+
+                                    // Clear local session data completely
+                                    self.sessionManager.clearSession();
+
+                                    // Create NEW fresh session
+                                    self.sessionManager.getOrCreateSession();
+
+                                    // Reconnect SSE with new session
+                                    self._startSessionEventStream();
+                                    return; // exit this stream reader
+                                }
+                            } catch (e) {
+                                window.DebugLogger.error('Error parsing SSE event:', e);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    if (error.name === 'AbortError') return; // intentional abort
+                    window.DebugLogger.warn('SSE connection error, reconnecting in 5s...', error);
+                    setTimeout(() => self._startSessionEventStream(), 5000);
                 }
-            }, 60000); // Check every 60 seconds
+            })();
         }
 
         /**
@@ -1156,6 +1202,7 @@ window.UIManager = UIManager;
 
         /**
          * Handle sending a message
+         * Simplified: No status checks, no warning thresholds
          */
         async _handleSendMessage() {
             const message = this.uiManager.getInputValue();
@@ -1164,85 +1211,42 @@ window.UIManager = UIManager;
                 return;
             }
 
+            // Ensure valid session
             const session = this.sessionManager.getOrCreateSession();
-            const sessionId = session.session_id;
 
-            // Only check session status if:
-            // 1. This is a returning user (has lead_id), OR
-            // 2. This session has already sent messages before
-            const shouldCheckStatus = session.isReturning || this.sessionManager.getMessageCount() > 0;
-
-            if (shouldCheckStatus) {
-                console.log(`🔍 Checking session ${sessionId} status...`);
-                const status = await this.apiClient.checkSessionStatus(sessionId);
-                console.log(`📊 Session status:`, status);
-                
-                if (status && status.expired === true) {
-                    console.warn("⏰ Session expired - creating new session before sending message");
-                    
-                    // Clear old messages
-                    this.uiManager.clearMessages();
-                    
-                    // Show expiry message
-                    this.uiManager.showExpiryMessage();
-                    
-                    // Create new session
-                    const oldLeadId = this.sessionManager.getLeadId();
-                    this.sessionManager._cachedSession = null;
-                    const newSession = this.sessionManager.getOrCreateSession();
-                    
-                    // Re-link lead_id
-                    if (oldLeadId) {
-                        await this.apiClient.initSession(newSession.session_id, oldLeadId);
-                    }
-                    
-                    // Now continue with the message using new session
-                    const newSessionId = newSession.session_id;
-                    this._sendMessageToBackend(message, newSessionId);
-                    return;
-                }
-            } else {
-                console.log('⏭️ Skipping status check for brand new session');
-            }
-
-            // Session is valid (or new), send normally
-            this._sendMessageToBackend(message, sessionId);
+            // Send directly
+            await this._sendMessageToBackend(message, session.session_id);
         }
 
         /**
          * Actually send the message to backend
          */
         async _sendMessageToBackend(message, sessionId) {
-            // Increment message count
-            const messageCount = this.sessionManager.incrementMessageCount();
-            
-            // Check if contact details provided in THIS session
-            const session = this.sessionManager.getOrCreateSession();
-            const hasProvidedContactInCurrentSession = session.contactProvidedInSession || false;
-            
-            const WARNING_THRESHOLD = 4; // Show warning after 4 messages
-            
-            // Show warning if user hasn't provided contact details in current session
-            if (messageCount === WARNING_THRESHOLD && !hasProvidedContactInCurrentSession) {
-                // Show warning before sending the message
-                this.uiManager.showContactWarning();
-            }
-            
-            // Add user message to UI
+
+            // Add user message to UI FIRST
             this.uiManager.addUserMessage(message);
             this.uiManager.clearInput();
             this.uiManager.disableInput();
 
-            // Show typing indicator
+            // CRITICAL FIX: Wait for the browser to paint the user message
+            // before starting the API call. Without this, if the backend responds
+            // very fast, the AI response bubble can appear before the user's
+            // message is visually rendered.
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+            // Show typing indicator (after user message is painted)
             this.uiManager.showTypingIndicator();
 
-            // Update activity
+            // Update activity timestamp
             this.sessionManager.updateActivity();
 
+            // Send to API
             await this.apiClient.sendMessage(message, sessionId, {
                 onToken: (content, node) => {
                     // Remove typing indicator on first token
-                    this.uiManager.hideTypingIndicator();
+                    if (this.uiManager.isTypingVisible) {
+                        this.uiManager.hideTypingIndicator();
+                    }
 
                     // Start AI message if not started
                     if (!this.uiManager.currentAIMessageElement) {
@@ -1254,30 +1258,41 @@ window.UIManager = UIManager;
                 },
 
                 onToolResult: (toolName, content) => {
-                    console.log(`Tool ${toolName} executed:`, content);
-
-                    // If check_lead or create_lead was called, user has shared contact info
-                    if (toolName === 'check_lead' || toolName === 'create_lead') {
-                        // Mark that contact was provided (regardless of found/not_found)
-                        this.sessionManager.markContactProvided();
-                        
-                        // Handle lead capture for successful cases
-                        this._handleLeadCapture(content);
-                    }
+                    // No frontend logic needed.
+                    // The Backend handles all identity logic.
                 },
 
                 onComplete: () => {
-                    console.log('Message stream complete');
                     this.uiManager.hideTypingIndicator();
                     this.uiManager.finishAIMessage();
-                    this.uiManager.enableInput();
-                    this.uiManager.focusInput();
+                    // Re-enable input ONLY after typewriter queue fully drains
+                    this.uiManager.onQueueDrained = () => {
+                        this.uiManager.enableInput();
+                        this.uiManager.focusInput();
+                    };
                 },
 
                 onError: (error) => {
-                    console.error('Error sending message:', error);
                     this.uiManager.hideTypingIndicator();
-                    this.uiManager.showError('Failed to send message. Please try again.');
+
+                    // Handle specific session archived error
+                    if (error.message === 'SESSION_ARCHIVED') {
+                        window.DebugLogger.warn('Backend rejected message: Session already archived. Rotating ID.');
+
+                        // Clear UI and Local Session
+                        this.uiManager.clearMessages();
+                        this.sessionManager.clearSession();
+
+                        // Show expiry message
+                        this.uiManager.showExpiryMessage();
+
+                        // Create NEW session and re-start polling
+                        this.sessionManager.getOrCreateSession();
+                        this._startSessionEventStream();
+                    } else {
+                        this.uiManager.showError('Failed to send message. Please try again.');
+                    }
+
                     this.uiManager.enableInput();
                     this.uiManager.focusInput();
                 }
@@ -1285,66 +1300,10 @@ window.UIManager = UIManager;
         }
 
         /**
-         * Handle lead capture from tool results
-         * @param {string} toolContent - Tool result content (JSON string)
-         */
-        _handleLeadCapture(toolContent) {
-            try {
-                let data = toolContent;
-
-                // Parse JSON string
-                if (typeof data === 'string') {
-                    data = JSON.parse(data);
-                }
-
-                // Handle array format: [{type: 'text', text: '...'}]
-                if (Array.isArray(data) && data.length > 0) {
-                    const item = data[0];
-                    if (item.text && typeof item.text === 'string') {
-                        data = JSON.parse(item.text);
-                    } else if (typeof item === 'object') {
-                        data = item;
-                    }
-                }
-
-                // Handle single object with text field: {type: 'text', text: '...'}
-                if (data.type === 'text' && data.text) {
-                    data = JSON.parse(data.text);
-                }
-
-                // Check if lead was successfully captured
-                if (data.status === 'success' && data.lead_id) {
-                    console.log('✅ Lead captured:', data.lead_id);
-
-                    // Update session with lead info (this also resets message count)
-                    this.sessionManager.updateLeadInfo(
-                        data.lead_id,
-                        data.phone || null,
-                        data.email || null,
-                        data.name || null
-                    );
-                } else if (data.status === 'not_found') {
-                    console.log('ℹ️ Contact details provided but lead not found in system');
-                    // Contact was provided, just not found - this is fine
-                    // contactProvidedInSession is already marked in onToolResult
-                }
-            } catch (e) {
-                // Only log unexpected errors (not "not_found" cases)
-                if (!String(toolContent).includes('"status":"not_found"')) {
-                    console.error('Error parsing lead capture data:', e, toolContent);
-                }
-            }
-        }
-
-        /**
          * Public API: Send message programmatically
          */
         sendMessage(message) {
-            if (!this.initialized) {
-                console.error('Widget not initialized');
-                return;
-            }
-
+            if (!this.initialized) return;
             this.uiManager.inputField.value = message;
             this._handleSendMessage();
         }
@@ -1353,10 +1312,7 @@ window.UIManager = UIManager;
          * Public API: Open widget
          */
         open() {
-            if (!this.initialized) {
-                console.error('Widget not initialized');
-                return;
-            }
+            if (!this.initialized) return;
             this.uiManager.open();
         }
 
@@ -1364,10 +1320,7 @@ window.UIManager = UIManager;
          * Public API: Close widget
          */
         close() {
-            if (!this.initialized) {
-                console.error('Widget not initialized');
-                return;
-            }
+            if (!this.initialized) return;
             this.uiManager.close();
         }
 
@@ -1375,28 +1328,18 @@ window.UIManager = UIManager;
          * Public API: Clear session
          */
         clearSession() {
-            if (!this.initialized) {
-                console.error('Widget not initialized');
-                return;
-            }
+            if (!this.initialized) return;
             this.sessionManager.clearSession();
-            console.log('Session cleared. Refresh page to start new session.');
         }
 
         /**
-         * Public API: Get session info (for debugging)
+         * Public API: Get session info
          */
         getSessionInfo() {
-            if (!this.initialized) {
-                console.error('Widget not initialized');
-                return null;
-            }
+            if (!this.initialized) return null;
 
             return {
-                session_id: this.sessionManager.getSessionId(),
-                lead_id: this.sessionManager.getLeadId(),
-                is_returning: this.sessionManager.isReturningUser(),
-                message_count: this.sessionManager.getMessageCount()
+                session_id: this.sessionManager.getSessionId()
             };
         }
     }
@@ -1407,7 +1350,6 @@ window.UIManager = UIManager;
     // Auto-initialize on DOMContentLoaded if config exists
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', () => {
-            // Check if auto-init config is provided
             if (window.ChatbotAutoInit) {
                 window.ChatbotWidget.init(window.ChatbotAutoInit);
             }
